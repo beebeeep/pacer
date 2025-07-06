@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use glommio::{
@@ -142,7 +142,7 @@ async fn serve(limiter: Limiter, addr: impl Into<SocketAddr>) -> io::Result<()> 
                 spawn_local(enclose! {(limiter)async move {
                     if let Err(e) = hyper::server::conn::http1::Builder::new().serve_connection(io, limiter.clone()).await {
                             if !e.is_incomplete_message() {
-                                eprintln!("Stream from {addr:?} failed with error {e:?}");
+                                warn!(addr:? = addr, err:? = e; "stream failed");
                             }
                     }
                 }})
