@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll},
 };
 
-pub(crate) struct HyperStream(pub TcpStream);
+pub struct HyperStream(pub TcpStream);
 
 impl hyper::rt::Write for HyperStream {
     fn poll_write(

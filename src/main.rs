@@ -1,5 +1,8 @@
 use clap::Parser;
-use log::{info, warn};
+use config::{Config, File};
+use log::{debug, info, warn};
+use pacer::{HyperStream, ResponseBody};
+use serde::Deserialize;
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -7,7 +10,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use glommio::{
@@ -15,22 +18,19 @@ use glommio::{
     net::TcpListener, spawn_local, timer,
 };
 use hyper::{Method, Request, Response, StatusCode, body::Incoming, service::Service};
-use hyper_compat::ResponseBody;
-
-mod hyper_compat;
 
 #[derive(Clone, Parser)]
 #[command(version, about = "pacer: rate limiter", long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "[::]:8080")]
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+}
+
+#[derive(Deserialize)]
+struct AppConfig {
     bind_addr: String,
-    #[arg(
-        short,
-        long,
-        help = "limits in format 'class=rps' (can specify multiple)",
-        default_value = "default=100"
-    )]
-    limit: Vec<String>,
+    classes: HashMap<String, u64>,
+    threads: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -121,12 +121,16 @@ fn parse_request_path(path: &str) -> Option<BucketKey> {
 
 async fn run_leaker(limits: HashMap<Arc<str>, u64>, buckets: Arc<Mutex<HashMap<BucketKey, u64>>>) {
     loop {
+        let s = Instant::now();
         {
             let mut buckets = buckets.lock().unwrap();
             buckets.iter_mut().for_each(|(key, v)| {
+                let limit = limits.get(&key.class).unwrap();
+                debug!(class:? = key.class, bucket:? = key.bucket, rps = limit - *v; "bucket rps");
                 *v = *limits.get(&key.class).unwrap(); // TODO: can limit bursting by going through buckets more often
             });
         }
+        info!(duration :? = s.elapsed(); "leak");
         timer::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -138,7 +142,7 @@ async fn serve(limiter: Limiter, addr: impl Into<SocketAddr>) -> io::Result<()> 
             Err(e) => return Err(e.into()),
             Ok(stream) => {
                 let addr = stream.local_addr().unwrap();
-                let io = hyper_compat::HyperStream(stream);
+                let io = HyperStream(stream);
                 spawn_local(enclose! {(limiter)async move {
                     if let Err(e) = hyper::server::conn::http1::Builder::new().serve_connection(io, limiter.clone()).await {
                             if !e.is_incomplete_message() {
@@ -156,34 +160,38 @@ fn main() {
     env_logger::init();
 
     let args = Args::parse();
+    let config = Config::builder()
+        .add_source(File::with_name(&args.config).required(true))
+        .build()
+        .unwrap();
+    let cfg: AppConfig = config.try_deserialize().unwrap();
+
     let cpus = CpuSet::online().unwrap();
     let buckets = Arc::new(Mutex::new(HashMap::new()));
     let mut limits = HashMap::new();
-    for class in args.limit {
-        let mut p = class.split("=");
-        let class = Arc::from(p.next().unwrap());
-        let limit: u64 = p.next().unwrap().parse().unwrap();
-        limits.insert(class, limit);
+    for (class, rps) in cfg.classes {
+        limits.insert(Arc::from(class.as_str()), rps);
     }
     let limiter = Limiter {
         buckets: buckets.clone(),
         limits: limits.clone(),
     };
 
-    info!(binding_addr:% = args.bind_addr, limits:? ; "starting");
-    // spawn leaker on cpu 0 and network threads on the rest of cpus
+    info!(binding_addr:% = cfg.bind_addr, limits:? ; "starting");
+    // spawn leaker on cpu 0 and network threads on the rest of cpus up to requested limit
     let leaker = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(async move || {
             run_leaker(limits, buckets).await;
         })
         .expect("spawning leaker");
 
-    let net_cpus = cpus.filter(|l| l.cpu > 0);
+    let net_cpus = cpus.filter(|l| l.cpu > 0 && l.cpu <= cfg.threads);
+    assert!(net_cpus.len() > 0, "not enough CPUs");
     let network_threads =
         LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(net_cpus.len(), Some(net_cpus)))
             .on_all_shards(|| async move {
                 let id = glommio::executor().id();
-                let addr = args.bind_addr.parse::<SocketAddr>().unwrap();
+                let addr = cfg.bind_addr.parse::<SocketAddr>().unwrap();
                 info!(id; "starting server");
                 serve(limiter, addr).await.unwrap();
             })

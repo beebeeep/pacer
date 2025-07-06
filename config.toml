@@ -1,0 +1,3 @@
+threads = 2
+bind_addr = "[::]:8080"
+classes.default = 1000000

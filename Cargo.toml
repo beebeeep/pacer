@@ -4,9 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytes = "1.10.1"
 clap = { version = "4.5.40", features = ["derive"] }
+config = "0.15.11"
 env_logger = { version = "0.11.8", features = ["kv"] }
 futures-lite = "2.6.0"
 glommio = "0.9.0"
+http-body-util = "0.1.3"
 hyper = { version = "1.6.0", features = ["client", "http1", "server"] }
 log = { version = "0.4.27", features = ["kv"] }
+serde = { version = "1.0.219", features = ["derive"] }
+
+[[example]]
+name = "bench"
+
+[dev-dependencies]
+hdrhistogram = "7.5.4"
+reqwest = "0.12.22"
