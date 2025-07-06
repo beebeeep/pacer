@@ -1,0 +1,12 @@
+[package]
+name = "pacer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+env_logger = { version = "0.11.8", features = ["kv"] }
+futures-lite = "2.6.0"
+glommio = "0.9.0"
+hyper = { version = "1.6.0", features = ["client", "http1", "server"] }
+log = { version = "0.4.27", features = ["kv"] }
