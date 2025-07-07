@@ -19,5 +19,5 @@ serde = { version = "1.0.219", features = ["derive"] }
 name = "bench"
 
 [dev-dependencies]
+atomic-counter = "1.0.1"
 hdrhistogram = "7.5.4"
-reqwest = "0.12.22"

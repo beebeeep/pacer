@@ -1,23 +1,23 @@
 use clap::Parser;
 use config::{Config, File};
-use log::{debug, info, warn};
-use pacer::{HyperStream, ResponseBody};
+use glommio::{
+    CpuSet, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement, spawn_local,
+    timer,
+};
+use hyper::{Method, Request, Response, StatusCode, body::Incoming, service::Service};
+use hyper_compat::{ResponseBody, start_http_server};
+use log::{debug, info};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    io,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use glommio::{
-    CpuSet, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement, enclose,
-    net::TcpListener, spawn_local, timer,
-};
-use hyper::{Method, Request, Response, StatusCode, body::Incoming, service::Service};
+pub mod hyper_compat;
 
 #[derive(Clone, Parser)]
 #[command(version, about = "pacer: rate limiter", long_about = None)]
@@ -29,41 +29,36 @@ struct Args {
 #[derive(Deserialize)]
 struct AppConfig {
     bind_addr: String,
-    classes: HashMap<String, u64>,
     threads: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BucketKey {
-    class: Arc<str>,
+    limit: u64,
     bucket: Arc<str>,
 }
 
 #[derive(Clone)]
 struct Limiter {
-    limits: HashMap<Arc<str>, u64>,
     buckets: Arc<Mutex<HashMap<BucketKey, u64>>>,
 }
 
 impl Limiter {
-    fn bump(&self, bucket: BucketKey) -> Option<bool> {
+    fn bump(&self, bucket: BucketKey) -> bool {
         let mut buckets = self.buckets.lock().unwrap();
         match buckets.get_mut(&bucket) {
             Some(counter) => {
                 if *counter == 0 {
-                    Some(false)
+                    false
                 } else {
                     *counter -= 1;
-                    Some(true)
+                    true
                 }
             }
             None => {
-                if let Some(limit) = self.limits.get(&bucket.class) {
-                    buckets.insert(bucket, *limit);
-                    Some(true)
-                } else {
-                    None
-                }
+                let limit = bucket.limit;
+                buckets.insert(bucket, limit);
+                true
             }
         }
     }
@@ -79,17 +74,13 @@ impl Service<Request<Incoming>> for Limiter {
                 let resp = Response::builder();
                 match parse_request_path(path) {
                     Some(k) => match self.bump(k) {
-                        Some(true) => Ok(resp
+                        true => Ok(resp
                             .status(StatusCode::OK)
                             .body(ResponseBody::from(""))
                             .unwrap()),
-                        Some(false) => Ok(resp
+                        false => Ok(resp
                             .status(StatusCode::TOO_MANY_REQUESTS)
                             .body(ResponseBody::from(""))
-                            .unwrap()),
-                        None => Ok(resp
-                            .status(StatusCode::NOT_FOUND)
-                            .body(ResponseBody::from("bucket class not found"))
                             .unwrap()),
                     },
                     _ => Ok(resp
@@ -110,24 +101,23 @@ impl Service<Request<Incoming>> for Limiter {
 fn parse_request_path(path: &str) -> Option<BucketKey> {
     let mut parts = path.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(""), Some(class), Some(bucket), None) => {
-            let class = Arc::from(class);
+        (Some(""), Some(limit), Some(bucket), None) => {
+            let limit = limit.parse().ok()?;
             let bucket = Arc::from(bucket);
-            Some(BucketKey { class, bucket })
+            Some(BucketKey { limit, bucket })
         }
         _ => None,
     }
 }
 
-async fn run_leaker(limits: HashMap<Arc<str>, u64>, buckets: Arc<Mutex<HashMap<BucketKey, u64>>>) {
+async fn run_leaker(buckets: Arc<Mutex<HashMap<BucketKey, u64>>>) {
     loop {
         let s = Instant::now();
         {
             let mut buckets = buckets.lock().unwrap();
             buckets.iter_mut().for_each(|(key, v)| {
-                let limit = limits.get(&key.class).unwrap();
-                debug!(class:? = key.class, bucket:? = key.bucket, rps = limit - *v; "bucket rps");
-                *v = *limits.get(&key.class).unwrap(); // TODO: can limit bursting by going through buckets more often
+                debug!(limit:? = key.limit, bucket:? = key.bucket, rps = key.limit - *v; "bucket rps");
+                *v = key.limit; // TODO: can limit bursting by going through buckets more often
             });
         }
         info!(duration :? = s.elapsed(); "leak");
@@ -135,25 +125,9 @@ async fn run_leaker(limits: HashMap<Arc<str>, u64>, buckets: Arc<Mutex<HashMap<B
     }
 }
 
-async fn serve(limiter: Limiter, addr: impl Into<SocketAddr>) -> io::Result<()> {
-    let listener = TcpListener::bind(addr.into())?;
-    loop {
-        match listener.accept().await {
-            Err(e) => return Err(e.into()),
-            Ok(stream) => {
-                let addr = stream.local_addr().unwrap();
-                let io = HyperStream(stream);
-                spawn_local(enclose! {(limiter)async move {
-                    if let Err(e) = hyper::server::conn::http1::Builder::new().serve_connection(io, limiter.clone()).await {
-                            if !e.is_incomplete_message() {
-                                warn!(addr:? = addr, err:? = e; "stream failed");
-                            }
-                    }
-                }})
-                .detach();
-            }
-        }
-    }
+async fn run_dispatcher(buckets: Arc<Mutex<HashMap<BucketKey, u64>>>) {
+    let leaker = spawn_local(run_leaker(buckets)).detach();
+    let _ = leaker.await;
 }
 
 fn main() {
@@ -168,20 +142,15 @@ fn main() {
 
     let cpus = CpuSet::online().unwrap();
     let buckets = Arc::new(Mutex::new(HashMap::new()));
-    let mut limits = HashMap::new();
-    for (class, rps) in cfg.classes {
-        limits.insert(Arc::from(class.as_str()), rps);
-    }
     let limiter = Limiter {
         buckets: buckets.clone(),
-        limits: limits.clone(),
     };
 
-    info!(binding_addr:% = cfg.bind_addr, limits:? ; "starting");
+    info!(binding_addr:% = cfg.bind_addr; "starting");
     // spawn leaker on cpu 0 and network threads on the rest of cpus up to requested limit
     let leaker = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(async move || {
-            run_leaker(limits, buckets).await;
+            run_dispatcher(buckets).await;
         })
         .expect("spawning leaker");
 
@@ -193,7 +162,7 @@ fn main() {
                 let id = glommio::executor().id();
                 let addr = cfg.bind_addr.parse::<SocketAddr>().unwrap();
                 info!(id; "starting server");
-                serve(limiter, addr).await.unwrap();
+                start_http_server(limiter, addr).await.unwrap();
             })
             .unwrap();
     for l in network_threads.join_all() {
