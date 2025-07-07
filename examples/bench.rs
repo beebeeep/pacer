@@ -58,7 +58,7 @@ async fn start_test(req_counter: Arc<RelaxedCounter>) {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/20000/foo")
+            .uri("/limit/20000/foo")
             .body(Empty::<Bytes>::new())
             .unwrap();
         let res = sender.send_request(req).await.unwrap();

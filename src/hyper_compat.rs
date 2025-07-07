@@ -1,3 +1,4 @@
+use bytes::Buf;
 use futures_lite::{AsyncRead, AsyncWrite};
 use glommio::{
     net::{TcpListener, TcpStream},
@@ -68,11 +69,11 @@ pub(crate) struct ResponseBody {
     data: Option<Bytes>,
 }
 
-impl From<&'static str> for ResponseBody {
-    fn from(data: &'static str) -> Self {
+impl From<&str> for ResponseBody {
+    fn from(data: &str) -> Self {
         ResponseBody {
             _marker: PhantomData,
-            data: Some(Bytes::from(data)),
+            data: Some(Bytes::copy_from_slice(data.as_bytes())),
         }
     }
 }
@@ -88,7 +89,7 @@ impl HttpBody for ResponseBody {
     }
 }
 
-pub(crate) async fn start_http_server<S>(svc: S, addr: impl Into<SocketAddr>) -> io::Result<()>
+pub(crate) async fn start_http_server<S>(svc: S, addr: SocketAddr) -> io::Result<()>
 where
     S: Clone + 'static,
     S: HttpService<hyper::body::Incoming>,
@@ -96,7 +97,7 @@ where
     S::ResBody: 'static,
     <S::ResBody as hyper::body::Body>::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let listener = TcpListener::bind(addr.into())?;
+    let listener = TcpListener::bind(addr)?;
     loop {
         let svc = svc.clone();
         match listener.accept().await {
