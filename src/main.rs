@@ -1,23 +1,26 @@
-use bytes::Buf;
 use clap::Parser;
 use config::{Config, File};
+use flexbuffers::FlexbufferSerializer;
 use glommio::{
-    CpuSet, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement, spawn_local,
-    timer,
+    CpuSet, LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
+    net::TcpStream, spawn_local, timer,
 };
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use hyper::{
-    Method, Request as HttpRequest, Response, StatusCode, body::Incoming, service::Service,
+    Method, Request as HttpRequest, Response, StatusCode,
+    body::{self, Incoming},
+    client::conn::http1,
+    service::Service,
 };
-use hyper_compat::{ResponseBody, start_http_server};
-use log::{debug, info};
+use hyper_compat::{HyperStream, ResponseBody, start_http_server};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use snafu::{ErrorCompat, ResultExt, Whatever, whatever};
+use snafu::{ResultExt, Whatever, whatever};
 use std::{
     collections::HashMap,
     convert::Infallible,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -68,55 +71,49 @@ struct AppConfig {
     replicas: Vec<String>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 struct BucketKey {
     limit: u64,
     bucket: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Counter {
-    local: u64,
-    remote: u64,
+    local_hits: u64,
+    remote_hits: u64,
+    leaked: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ReplicationData {
     buckets: Vec<BucketKey>,
-    counters: Vec<u64>,
+    counters: Vec<Counter>,
 }
 
 #[derive(Clone)]
 struct Limiter {
-    buckets: Arc<Mutex<HashMap<BucketKey, Counter>>>,
+    buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>,
 }
 
 #[derive(Clone)]
 struct Replicator {
-    cfg: AppConfig,
-    buckets: Arc<Mutex<HashMap<BucketKey, Counter>>>,
+    buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>,
 }
 
 impl Limiter {
-    fn bump(&self, bucket: BucketKey) -> bool {
-        let mut buckets = self.buckets.lock().unwrap();
+    fn hit(&self, bucket: BucketKey) -> bool {
+        let mut buckets = self.buckets.write().unwrap();
         match buckets.get_mut(&bucket) {
             Some(c) => {
-                if c.remote + c.local < bucket.limit {
-                    c.local += 1;
+                if c.hits - c.leaked < bucket.limit {
+                    c.hits += 1;
                     true
                 } else {
                     false
                 }
             }
             None => {
-                buckets.insert(
-                    bucket,
-                    Counter {
-                        remote: 0,
-                        local: 0,
-                    },
-                );
+                buckets.insert(bucket, Counter { hits: 0, leaked: 0 });
                 true
             }
         }
@@ -131,7 +128,7 @@ impl Service<HttpRequest<Incoming>> for Limiter {
         let res = match (req.method(), RequestURL::from(req.uri().path())) {
             (&Method::POST, RequestURL::Limit(k)) => {
                 let resp = Response::builder();
-                let status = if self.bump(k) {
+                let status = if self.hit(k) {
                     StatusCode::OK
                 } else {
                     StatusCode::TOO_MANY_REQUESTS
@@ -162,21 +159,22 @@ impl Replicator {
         if data.buckets.len() != data.counters.len() {
             whatever!("buckets and counters count mismatch");
         }
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.write().unwrap();
         for i in 0..data.buckets.len() {
             let key = BucketKey {
                 limit: data.buckets[i].limit,
                 bucket: data.buckets[i].bucket.clone(),
             };
-            let c = data.counters[i];
+            let c = &data.counters[i];
             buckets
                 .entry(key)
-                .and_modify(|e| e.remote += c)
-                .or_insert(Counter {
-                    local: 0,
-                    remote: c,
-                });
+                .and_modify(|e| {
+                    e.hits += c.hits;
+                    e.leaked += c.leaked
+                })
+                .or_insert(c.clone());
         }
+        debug!(buckets = buckets.len(); "processed replicated data");
 
         Ok(())
     }
@@ -187,10 +185,10 @@ impl Service<HttpRequest<Incoming>> for Replicator {
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
     fn call(&self, req: HttpRequest<Incoming>) -> Self::Future {
-        match (req.method(), RequestURL::from(req.uri().path())) {
-            (&Method::POST, RequestURL::Replicate) => {
-                let r = self.clone();
-                Box::pin(async move {
+        let r = self.clone();
+        Box::pin(async move {
+            match (req.method(), RequestURL::from(req.uri().path())) {
+                (&Method::POST, RequestURL::Replicate) => {
                     let b = Response::builder();
                     let r = match r.replicate(req).await {
                         Ok(_) => b
@@ -203,42 +201,104 @@ impl Service<HttpRequest<Incoming>> for Replicator {
                             .unwrap(),
                     };
                     Ok(r)
-                })
-            }
-            _ => Box::pin(async {
-                Ok(Response::builder()
+                }
+                _ => Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(ResponseBody::from("incorrect url"))
-                    .unwrap())
-            }),
-        }
+                    .unwrap()),
+            }
+        })
     }
 }
 
-async fn run_leaker(buckets: Arc<Mutex<HashMap<BucketKey, Counter>>>) {
+async fn run_leaker(buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>) {
     loop {
         let s = Instant::now();
         {
-            let mut buckets = buckets.lock().unwrap();
+            let mut buckets = buckets.write().unwrap();
             buckets.iter_mut().for_each(|(k, v)| {
-                v.local = v.local.saturating_sub(k.limit); // TODO: can limit bursting by going through buckets more often
+                v.leaked += k.limit; // TODO: can limit bursting by going through buckets more often
             });
         }
-        info!(duration :? = s.elapsed(); "leak");
+        debug!(duration :? = s.elapsed(); "leak");
         timer::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn run_dispatcher(cfg: &AppConfig, buckets: Arc<Mutex<HashMap<BucketKey, Counter>>>) {
+async fn run_distributor(buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>, replicas: Vec<String>) {
+    loop {
+        let mut data = ReplicationData {
+            buckets: Vec::new(),
+            counters: Vec::new(),
+        };
+        {
+            let buckets = buckets.read().unwrap();
+            for (k, v) in buckets.iter() {
+                debug!(bucket:? = k, hits = v.hits, leaked = v.leaked; "bucket info");
+                data.buckets.push(k.clone());
+                data.counters.push(v.clone());
+            }
+        }
+        timer::sleep(Duration::from_secs(1)).await;
+        let mut handles = Vec::with_capacity(replicas.len());
+        for replica in replicas.iter() {
+            let replica = replica.clone();
+            handles.push(spawn_local(send_replication_data(replica, data.clone())).detach());
+        }
+        for h in handles {
+            if let Err(e) = h.await.unwrap() {
+                warn!(err:? = e; "failed to replicate data");
+            }
+        }
+        debug!(buckets = data.buckets.len(); "sent replicatin data");
+    }
+}
+
+async fn send_replication_data(replica: String, data: ReplicationData) -> Result<(), Whatever> {
+    let mut ser = FlexbufferSerializer::new();
+    data.serialize(&mut ser)
+        .whatever_context("serializing replication data")?;
+    let data = ser.take_buffer();
+    let stream = TcpStream::connect(replica)
+        .await
+        .whatever_context("connecting")?;
+    let stream = HyperStream(stream);
+
+    let (mut sender, conn) = http1::handshake(stream)
+        .await
+        .whatever_context("handshake")?;
+    spawn_local(async move {
+        if let Err(e) = conn.await {
+            warn!(err:? = e;"replica connection error");
+        }
+    })
+    .detach();
+
+    let req = HttpRequest::builder()
+        .method("POST")
+        .uri("/replicate")
+        .body(Full::<body::Bytes>::from(data))
+        .whatever_context("building request")?;
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .whatever_context("sending request")?;
+    if resp.status() != StatusCode::OK {
+        whatever!("bad response code {:?}", resp.status());
+    }
+    Ok(())
+}
+
+async fn run_dispatcher(cfg: &AppConfig, buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>) {
     let leaker = spawn_local(run_leaker(buckets.clone())).detach();
-    let replicator = Replicator {
-        cfg: cfg.clone(),
-        buckets,
-    };
+    let distributor = spawn_local(run_distributor(buckets.clone(), cfg.replicas.clone())).detach();
+    let replicator = Replicator { buckets };
     start_http_server(replicator, cfg.replicator_addr.parse().unwrap())
         .await
         .unwrap();
     let _ = leaker.await.unwrap();
+    let _ = distributor.await.unwrap();
 }
 
 fn main() {
@@ -252,7 +312,7 @@ fn main() {
     let cfg: AppConfig = config.try_deserialize().unwrap();
 
     let cpus = CpuSet::online().unwrap();
-    let buckets = Arc::new(Mutex::new(HashMap::new()));
+    let buckets = Arc::new(RwLock::new(HashMap::new()));
     let limiter = Limiter {
         buckets: buckets.clone(),
     };

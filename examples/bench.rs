@@ -12,22 +12,12 @@ use std::{
 };
 
 fn main() {
-    let cpus = CpuSet::online().unwrap().filter(|l| l.cpu > 3);
     let req_counter = Arc::new(atomic_counter::RelaxedCounter::new(0));
     let cnt = req_counter.clone();
-    let _w =
-        LocalExecutorPoolBuilder::new(glommio::PoolPlacement::MaxSpread(cpus.len(), Some(cpus)))
-            .on_all_shards(|| async move {
-                let mut tasks = Vec::new();
-                for _ in 0..5 {
-                    let cnt = cnt.clone();
-                    tasks.push(spawn_local(async move { start_test(cnt).await }).detach());
-                }
-                for t in tasks {
-                    t.await.unwrap();
-                }
-            })
-            .unwrap();
+
+    // loadtest(cnt);
+    small_test(cnt);
+
     loop {
         let c = req_counter.get();
         let t = Instant::now();
@@ -39,13 +29,41 @@ fn main() {
     }
 }
 
-async fn start_test(req_counter: Arc<RelaxedCounter>) {
+fn loadtest(cnt: Arc<RelaxedCounter>) {
+    let cpus = CpuSet::online().unwrap().filter(|l| l.cpu > 3);
+    let _w =
+        LocalExecutorPoolBuilder::new(glommio::PoolPlacement::MaxSpread(cpus.len(), Some(cpus)))
+            .on_all_shards(|| async move {
+                let mut tasks = Vec::new();
+                for _ in 0..5 {
+                    let cnt = cnt.clone();
+                    tasks.push(spawn_local(start_test(cnt, 20000)).detach());
+                }
+                for t in tasks {
+                    t.await.unwrap();
+                }
+            })
+            .unwrap();
+}
+
+fn small_test(cnt: Arc<RelaxedCounter>) {
+    let _w = LocalExecutorPoolBuilder::new(glommio::PoolPlacement::Unbound(2))
+        .on_all_shards(|| async move {
+            start_test(cnt, 100).await;
+        })
+        .unwrap();
+}
+
+async fn start_test(req_counter: Arc<RelaxedCounter>, limit: u64) {
     let mut hist = Histogram::<u64>::new_with_bounds(1, 1000000, 2).unwrap();
     let mut show_hist = Instant::now();
-    let mut count = 0;
+    let mut count = 0usize;
+    let endpoints = vec!["localhost:8080", "localhost:8090", "localhost:8070"];
     loop {
         let s = Instant::now();
-        let stream = TcpStream::connect("localhost:8080").await.unwrap();
+        let stream = TcpStream::connect(endpoints[count.rem_euclid(endpoints.len())])
+            .await
+            .unwrap();
         let stream = HyperStream(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
 
@@ -58,7 +76,7 @@ async fn start_test(req_counter: Arc<RelaxedCounter>) {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/limit/20000/foo")
+            .uri(format!("/limit/{limit}/foo"))
             .body(Empty::<Bytes>::new())
             .unwrap();
         let res = sender.send_request(req).await.unwrap();
