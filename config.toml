@@ -1,4 +1,5 @@
+id = 1
 threads = 2
 limiter_addr = "[::]:8080"
 replicator_addr = "[::]:8081"
-replicas = [ "localhost:8071", "localhost:8091" ]
+replicas = [ "localhost:8091", "localhost:8071" ]

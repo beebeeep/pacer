@@ -1,3 +1,4 @@
+id = 2
 threads = 2
 limiter_addr = "[::]:8090"
 replicator_addr = "[::]:8091"

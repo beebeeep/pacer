@@ -65,6 +65,7 @@ struct Args {
 
 #[derive(Deserialize, Clone)]
 struct AppConfig {
+    id: u32,
     limiter_addr: String,
     replicator_addr: String,
     threads: usize,
@@ -76,28 +77,30 @@ struct BucketKey {
     limit: u64,
     bucket: String,
 }
+type Buckets = HashMap<BucketKey, Counter>;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Counter {
     local_hits: u64,
-    remote_hits: u64,
-    leaked: u64,
+    remote_hits: u64, // sum of local_hits from all peers
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 struct ReplicationData {
+    node_id: u32,
     buckets: Vec<BucketKey>,
-    counters: Vec<Counter>,
+    hits: Vec<u64>,
 }
 
 #[derive(Clone)]
 struct Limiter {
-    buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>,
+    buckets: Arc<RwLock<Buckets>>,
 }
 
 #[derive(Clone)]
 struct Replicator {
-    buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>,
+    peers_buckets: Arc<RwLock<HashMap<u32, Buckets>>>,
+    buckets: Arc<RwLock<Buckets>>,
 }
 
 impl Limiter {
@@ -105,15 +108,21 @@ impl Limiter {
         let mut buckets = self.buckets.write().unwrap();
         match buckets.get_mut(&bucket) {
             Some(c) => {
-                if c.hits - c.leaked < bucket.limit {
-                    c.hits += 1;
+                if c.local_hits + c.remote_hits < bucket.limit {
+                    c.local_hits += 1;
                     true
                 } else {
                     false
                 }
             }
             None => {
-                buckets.insert(bucket, Counter { hits: 0, leaked: 0 });
+                buckets.insert(
+                    bucket,
+                    Counter {
+                        local_hits: 0,
+                        remote_hits: 0,
+                    },
+                );
                 true
             }
         }
@@ -146,7 +155,26 @@ impl Service<HttpRequest<Incoming>> for Limiter {
 }
 
 impl Replicator {
+    fn update_buckets(&self, peer_id: u32, new_peer_buckets: HashMap<BucketKey, Counter>) {
+        let mut peers_buckets = self.peers_buckets.write().unwrap();
+        let mut buckets = self.buckets.write().unwrap();
+
+        peers_buckets.insert(peer_id, new_peer_buckets);
+
+        for (bucket, counter) in buckets.iter_mut() {
+            // recalculate remote_hits for each bucket
+            // by summing respective local_hits for that bucket from each peer
+            counter.remote_hits = 0;
+            for (_, buckets) in peers_buckets.iter() {
+                if let Some(peer_counter) = buckets.get(bucket) {
+                    counter.remote_hits += peer_counter.local_hits;
+                }
+            }
+        }
+    }
+
     async fn replicate(&self, req: HttpRequest<Incoming>) -> Result<(), Whatever> {
+        let start = Instant::now();
         let body = req
             .collect()
             .await
@@ -156,25 +184,24 @@ impl Replicator {
             .whatever_context("failed to deserialize body")?;
         let data =
             ReplicationData::deserialize(des).whatever_context("failed to deserialize body")?;
-        if data.buckets.len() != data.counters.len() {
+        if data.buckets.len() != data.hits.len() {
             whatever!("buckets and counters count mismatch");
         }
-        let mut buckets = self.buckets.write().unwrap();
+
+        // update peer info
+        let mut new_peer_buckets = HashMap::new();
         for i in 0..data.buckets.len() {
-            let key = BucketKey {
-                limit: data.buckets[i].limit,
-                bucket: data.buckets[i].bucket.clone(),
-            };
-            let c = &data.counters[i];
-            buckets
-                .entry(key)
-                .and_modify(|e| {
-                    e.hits += c.hits;
-                    e.leaked += c.leaked
-                })
-                .or_insert(c.clone());
+            new_peer_buckets.insert(
+                data.buckets[i].clone(),
+                Counter {
+                    local_hits: data.hits[i],
+                    remote_hits: 0,
+                },
+            );
         }
-        debug!(buckets = buckets.len(); "processed replicated data");
+
+        self.update_buckets(data.node_id, new_peer_buckets);
+        debug!(peer = data.node_id, duration:? = start.elapsed();  "processed replicated data");
 
         Ok(())
     }
@@ -211,13 +238,13 @@ impl Service<HttpRequest<Incoming>> for Replicator {
     }
 }
 
-async fn run_leaker(buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>) {
+async fn run_leaker(buckets: Arc<RwLock<Buckets>>) {
     loop {
         let s = Instant::now();
         {
             let mut buckets = buckets.write().unwrap();
-            buckets.iter_mut().for_each(|(k, v)| {
-                v.leaked += k.limit; // TODO: can limit bursting by going through buckets more often
+            buckets.iter_mut().for_each(|(_bucket, counter)| {
+                counter.local_hits = 0; // TODO: can limit bursting by going through buckets more often 
             });
         }
         debug!(duration :? = s.elapsed(); "leak");
@@ -225,21 +252,22 @@ async fn run_leaker(buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>) {
     }
 }
 
-async fn run_distributor(buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>, replicas: Vec<String>) {
+async fn run_distributor(node_id: u32, buckets: Arc<RwLock<Buckets>>, replicas: Vec<String>) {
     loop {
+        let start = Instant::now();
         let mut data = ReplicationData {
+            node_id,
             buckets: Vec::new(),
-            counters: Vec::new(),
+            hits: Vec::new(),
         };
         {
             let buckets = buckets.read().unwrap();
             for (k, v) in buckets.iter() {
-                debug!(bucket:? = k, hits = v.hits, leaked = v.leaked; "bucket info");
+                debug!(bucket:? = k, localhits = v.local_hits, remote_hits = v.remote_hits ; "bucket info");
                 data.buckets.push(k.clone());
-                data.counters.push(v.clone());
+                data.hits.push(v.local_hits);
             }
         }
-        timer::sleep(Duration::from_secs(1)).await;
         let mut handles = Vec::with_capacity(replicas.len());
         for replica in replicas.iter() {
             let replica = replica.clone();
@@ -250,7 +278,9 @@ async fn run_distributor(buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>, repl
                 warn!(err:? = e; "failed to replicate data");
             }
         }
-        debug!(buckets = data.buckets.len(); "sent replicatin data");
+        debug!(buckets = data.buckets.len(), duration:? = start.elapsed(); "sent replicatin data");
+
+        timer::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -290,10 +320,18 @@ async fn send_replication_data(replica: String, data: ReplicationData) -> Result
     Ok(())
 }
 
-async fn run_dispatcher(cfg: &AppConfig, buckets: Arc<RwLock<HashMap<BucketKey, Counter>>>) {
+async fn run_dispatcher(cfg: &AppConfig, buckets: Arc<RwLock<Buckets>>) {
     let leaker = spawn_local(run_leaker(buckets.clone())).detach();
-    let distributor = spawn_local(run_distributor(buckets.clone(), cfg.replicas.clone())).detach();
-    let replicator = Replicator { buckets };
+    let distributor = spawn_local(run_distributor(
+        cfg.id,
+        buckets.clone(),
+        cfg.replicas.clone(),
+    ))
+    .detach();
+    let replicator = Replicator {
+        buckets,
+        peers_buckets: Arc::new(RwLock::new(HashMap::new())),
+    };
     start_http_server(replicator, cfg.replicator_addr.parse().unwrap())
         .await
         .unwrap();
