@@ -12,32 +12,37 @@ use std::{
 };
 
 fn main() {
-    let req_counter = Arc::new(atomic_counter::RelaxedCounter::new(0));
-    let cnt = req_counter.clone();
+    let req_counter_ok = Arc::new(atomic_counter::RelaxedCounter::new(0));
+    let req_counter_rej = Arc::new(atomic_counter::RelaxedCounter::new(0));
+    let ok_cnt = req_counter_ok.clone();
+    let rej_cnt = req_counter_rej.clone();
 
-    // loadtest(cnt);
-    small_test(cnt);
+    // loadtest(ok_cnt, rej_cnt);
+    small_test(ok_cnt, rej_cnt);
 
     loop {
-        let c = req_counter.get();
+        let c_ok = req_counter_ok.get();
+        let c_rej = req_counter_rej.get();
         let t = Instant::now();
         thread::sleep(Duration::from_secs(1));
         eprintln!(
-            "allowed {} RPS",
-            (req_counter.get() - c) as f64 / t.elapsed().as_secs_f64()
+            "allowed {} RPS, rejected {} RPS",
+            (req_counter_ok.get() - c_ok) as f64 / t.elapsed().as_secs_f64(),
+            (req_counter_rej.get() - c_rej) as f64 / t.elapsed().as_secs_f64(),
         );
     }
 }
 
-fn loadtest(cnt: Arc<RelaxedCounter>) {
+fn loadtest(ok_cnt: Arc<RelaxedCounter>, rej_cnt: Arc<RelaxedCounter>) {
     let cpus = CpuSet::online().unwrap().filter(|l| l.cpu > 3);
     let _w =
         LocalExecutorPoolBuilder::new(glommio::PoolPlacement::MaxSpread(cpus.len(), Some(cpus)))
             .on_all_shards(|| async move {
                 let mut tasks = Vec::new();
                 for _ in 0..5 {
-                    let cnt = cnt.clone();
-                    tasks.push(spawn_local(start_test(cnt, 20000)).detach());
+                    let ok_cnt = ok_cnt.clone();
+                    let rej_cnt = rej_cnt.clone();
+                    tasks.push(spawn_local(start_test(ok_cnt, rej_cnt, 20000)).detach());
                 }
                 for t in tasks {
                     t.await.unwrap();
@@ -46,19 +51,24 @@ fn loadtest(cnt: Arc<RelaxedCounter>) {
             .unwrap();
 }
 
-fn small_test(cnt: Arc<RelaxedCounter>) {
+fn small_test(ok_cnt: Arc<RelaxedCounter>, rej_cnt: Arc<RelaxedCounter>) {
     let _w = LocalExecutorPoolBuilder::new(glommio::PoolPlacement::Unbound(2))
         .on_all_shards(|| async move {
-            start_test(cnt, 100).await;
+            start_test(ok_cnt, rej_cnt, 100).await;
         })
         .unwrap();
 }
 
-async fn start_test(req_counter: Arc<RelaxedCounter>, limit: u64) {
+async fn start_test(
+    req_counter_ok: Arc<RelaxedCounter>,
+    req_counter_rej: Arc<RelaxedCounter>,
+    limit: u64,
+) {
     let mut hist = Histogram::<u64>::new_with_bounds(1, 1000000, 2).unwrap();
     let mut show_hist = Instant::now();
     let mut count = 0usize;
-    let endpoints = vec!["localhost:8080", "localhost:8090", "localhost:8070"];
+    // let endpoints = vec!["localhost:8080", "localhost:8090", "localhost:8070"];
+    let endpoints = vec!["127.0.0.1:8000"];
     loop {
         let s = Instant::now();
         let stream = TcpStream::connect(endpoints[count.rem_euclid(endpoints.len())])
@@ -81,8 +91,11 @@ async fn start_test(req_counter: Arc<RelaxedCounter>, limit: u64) {
             .unwrap();
         let res = sender.send_request(req).await.unwrap();
         if res.status() == StatusCode::OK {
-            req_counter.inc();
+            req_counter_ok.inc();
+        } else if res.status() == StatusCode::TOO_MANY_REQUESTS {
+            req_counter_rej.inc();
         }
+
         count += 1;
         hist.record(s.elapsed().as_micros() as u64).unwrap();
         if show_hist.elapsed() > Duration::from_secs(5) {

@@ -14,5 +14,6 @@ You can configure arbitrary number of replicas, they will be synchronizing their
 so that RPS limit for each bucket is calculated across the whole cluster.
 Then you can simply have any HTTP load balancer doing round-robin routing across all replicas.
 
-
-
+If `require_quorum` configuration is enabled, then node will start returning 429s for all requests
+if it failed to synchronize with quorum of its peers. This can be used to prevent overshooting the RPS limit
+in case of network partitioning between limiter node.

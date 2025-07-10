@@ -70,6 +70,7 @@ struct AppConfig {
     replicator_addr: String,
     threads: usize,
     replicas: Vec<String>,
+    require_quorum: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -77,7 +78,12 @@ struct BucketKey {
     limit: u64,
     bucket: String,
 }
+
 type Buckets = HashMap<BucketKey, Counter>;
+struct LimiterState {
+    buckets: Buckets,
+    has_quorum: bool,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Counter {
@@ -94,19 +100,23 @@ struct ReplicationData {
 
 #[derive(Clone)]
 struct Limiter {
-    buckets: Arc<RwLock<Buckets>>,
+    require_quorum: bool,
+    state: Arc<RwLock<LimiterState>>,
 }
 
 #[derive(Clone)]
 struct Replicator {
     peers_buckets: Arc<RwLock<HashMap<u32, Buckets>>>,
-    buckets: Arc<RwLock<Buckets>>,
+    state: Arc<RwLock<LimiterState>>,
 }
 
 impl Limiter {
     fn hit(&self, bucket: BucketKey) -> bool {
-        let mut buckets = self.buckets.write().unwrap();
-        match buckets.get_mut(&bucket) {
+        let mut state = self.state.write().unwrap();
+        if self.require_quorum && !state.has_quorum {
+            return false;
+        }
+        match state.buckets.get_mut(&bucket) {
             Some(c) => {
                 if c.local_hits + c.remote_hits < bucket.limit {
                     c.local_hits += 1;
@@ -116,7 +126,7 @@ impl Limiter {
                 }
             }
             None => {
-                buckets.insert(
+                state.buckets.insert(
                     bucket,
                     Counter {
                         local_hits: 0,
@@ -136,7 +146,7 @@ impl Service<HttpRequest<Incoming>> for Limiter {
     fn call(&self, req: HttpRequest<Incoming>) -> Self::Future {
         let res = match (req.method(), RequestURL::from(req.uri().path())) {
             (&Method::POST, RequestURL::Limit(k)) => {
-                let resp = Response::builder();
+                let resp = Response::builder().header("Connection", "close");
                 let status = if self.hit(k) {
                     StatusCode::OK
                 } else {
@@ -157,11 +167,11 @@ impl Service<HttpRequest<Incoming>> for Limiter {
 impl Replicator {
     fn update_buckets(&self, peer_id: u32, new_peer_buckets: HashMap<BucketKey, Counter>) {
         let mut peers_buckets = self.peers_buckets.write().unwrap();
-        let mut buckets = self.buckets.write().unwrap();
+        let mut state = self.state.write().unwrap();
 
         peers_buckets.insert(peer_id, new_peer_buckets);
 
-        for (bucket, counter) in buckets.iter_mut() {
+        for (bucket, counter) in state.buckets.iter_mut() {
             // recalculate remote_hits for each bucket
             // by summing respective local_hits for that bucket from each peer
             counter.remote_hits = 0;
@@ -238,12 +248,12 @@ impl Service<HttpRequest<Incoming>> for Replicator {
     }
 }
 
-async fn run_leaker(buckets: Arc<RwLock<Buckets>>) {
+async fn run_leaker(state: Arc<RwLock<LimiterState>>) {
     loop {
         let s = Instant::now();
         {
-            let mut buckets = buckets.write().unwrap();
-            buckets.iter_mut().for_each(|(_bucket, counter)| {
+            let mut state = state.write().unwrap();
+            state.buckets.iter_mut().for_each(|(_bucket, counter)| {
                 counter.local_hits = 0; // TODO: can limit bursting by going through buckets more often 
             });
         }
@@ -252,32 +262,46 @@ async fn run_leaker(buckets: Arc<RwLock<Buckets>>) {
     }
 }
 
-async fn run_distributor(node_id: u32, buckets: Arc<RwLock<Buckets>>, replicas: Vec<String>) {
+async fn run_distributor(cfg: AppConfig, state: Arc<RwLock<LimiterState>>) {
     loop {
         let start = Instant::now();
         let mut data = ReplicationData {
-            node_id,
+            node_id: cfg.id,
             buckets: Vec::new(),
             hits: Vec::new(),
         };
+
+        // construct replication data under lock
         {
-            let buckets = buckets.read().unwrap();
-            for (k, v) in buckets.iter() {
+            let state = state.read().unwrap();
+            for (k, v) in state.buckets.iter() {
                 debug!(bucket:? = k, localhits = v.local_hits, remote_hits = v.remote_hits ; "bucket info");
                 data.buckets.push(k.clone());
                 data.hits.push(v.local_hits);
             }
         }
-        let mut handles = Vec::with_capacity(replicas.len());
-        for replica in replicas.iter() {
+
+        // distribute it
+        let mut handles = Vec::with_capacity(cfg.replicas.len());
+        for replica in cfg.replicas.iter() {
             let replica = replica.clone();
             handles.push(spawn_local(send_replication_data(replica, data.clone())).detach());
         }
+        let mut fails = 0;
         for h in handles {
             if let Err(e) = h.await.unwrap() {
+                fails += 1;
                 warn!(err:? = e; "failed to replicate data");
             }
         }
+
+        // if we failed to replicate our data to quorum of peers, transition into inactive mode
+        // this will prevent partitioning RPS counter in case of network partition
+        {
+            let mut state = state.write().unwrap();
+            state.has_quorum = fails < cfg.replicas.len() / 2 + 1;
+        }
+
         debug!(buckets = data.buckets.len(), duration:? = start.elapsed(); "sent replicatin data");
 
         timer::sleep(Duration::from_secs(1)).await;
@@ -289,9 +313,12 @@ async fn send_replication_data(replica: String, data: ReplicationData) -> Result
     data.serialize(&mut ser)
         .whatever_context("serializing replication data")?;
     let data = ser.take_buffer();
-    let stream = TcpStream::connect(replica)
+    let stream = TcpStream::connect_timeout(replica, Duration::from_millis(300))
         .await
         .whatever_context("connecting")?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .whatever_context("setting timeout")?;
     let stream = HyperStream(stream);
 
     let (mut sender, conn) = http1::handshake(stream)
@@ -320,21 +347,18 @@ async fn send_replication_data(replica: String, data: ReplicationData) -> Result
     Ok(())
 }
 
-async fn run_dispatcher(cfg: &AppConfig, buckets: Arc<RwLock<Buckets>>) {
+async fn run_dispatcher(cfg: &AppConfig, buckets: Arc<RwLock<LimiterState>>) {
     let leaker = spawn_local(run_leaker(buckets.clone())).detach();
-    let distributor = spawn_local(run_distributor(
-        cfg.id,
-        buckets.clone(),
-        cfg.replicas.clone(),
-    ))
-    .detach();
+    let distributor = spawn_local(run_distributor(cfg.clone(), buckets.clone())).detach();
+
     let replicator = Replicator {
-        buckets,
+        state: buckets,
         peers_buckets: Arc::new(RwLock::new(HashMap::new())),
     };
     start_http_server(replicator, cfg.replicator_addr.parse().unwrap())
         .await
         .unwrap();
+
     let _ = leaker.await.unwrap();
     let _ = distributor.await.unwrap();
 }
@@ -350,9 +374,13 @@ fn main() {
     let cfg: AppConfig = config.try_deserialize().unwrap();
 
     let cpus = CpuSet::online().unwrap();
-    let buckets = Arc::new(RwLock::new(HashMap::new()));
+    let buckets = Arc::new(RwLock::new(LimiterState {
+        buckets: HashMap::new(),
+        has_quorum: true,
+    }));
     let limiter = Limiter {
-        buckets: buckets.clone(),
+        require_quorum: cfg.require_quorum,
+        state: buckets.clone(),
     };
 
     // spawn leaker on cpu 0 and network threads on the rest of cpus up to requested limit

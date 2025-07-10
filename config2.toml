@@ -3,3 +3,4 @@ threads = 2
 limiter_addr = "[::]:8090"
 replicator_addr = "[::]:8091"
 replicas = [ "localhost:8081", "localhost:8071" ]
+require_quorum = true
