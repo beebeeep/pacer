@@ -71,6 +71,7 @@ struct AppConfig {
     threads: usize,
     replicas: Vec<String>,
     require_quorum: bool,
+    replication_period_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -304,7 +305,7 @@ async fn run_distributor(cfg: AppConfig, state: Arc<RwLock<LimiterState>>) {
 
         debug!(buckets = data.buckets.len(), duration:? = start.elapsed(); "sent replicatin data");
 
-        timer::sleep(Duration::from_secs(1)).await;
+        timer::sleep(Duration::from_millis(cfg.replication_period_ms)).await;
     }
 }
 
