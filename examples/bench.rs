@@ -33,6 +33,7 @@ fn main() {
     }
 }
 
+#[allow(dead_code)]
 fn loadtest(ok_cnt: Arc<RelaxedCounter>, rej_cnt: Arc<RelaxedCounter>) {
     let cpus = CpuSet::online().unwrap().filter(|l| l.cpu > 3);
     let _w =
@@ -51,6 +52,7 @@ fn loadtest(ok_cnt: Arc<RelaxedCounter>, rej_cnt: Arc<RelaxedCounter>) {
             .unwrap();
 }
 
+#[allow(dead_code)]
 fn small_test(ok_cnt: Arc<RelaxedCounter>, rej_cnt: Arc<RelaxedCounter>) {
     let _w = LocalExecutorPoolBuilder::new(glommio::PoolPlacement::Unbound(2))
         .on_all_shards(|| async move {

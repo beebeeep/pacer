@@ -88,6 +88,7 @@ impl HttpBody for ResponseBody {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn start_http_server<S>(svc: S, addr: SocketAddr) -> io::Result<()>
 where
     S: Clone + 'static,
