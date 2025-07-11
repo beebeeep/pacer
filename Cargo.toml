@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 readme = "README.md"
 repository = "https://github.com/beebeeep/pacer"
+description = "Distributed rate-limiter with HTTP interface"
 license = "MIT"
 keywords = ["http", "rate-limiter"]
 

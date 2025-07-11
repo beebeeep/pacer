@@ -1,4 +1,3 @@
-use bytes::Buf;
 use futures_lite::{AsyncRead, AsyncWrite};
 use glommio::{
     net::{TcpListener, TcpStream},
